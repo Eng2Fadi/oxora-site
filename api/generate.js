@@ -1,12 +1,9 @@
 // api/generate.js
-// Vercel Serverless Function
-// POST /api/generate
-
-export default async function handler(req, res) {
-// CORS
+module.exports = async function handler(req, res) {
 res.setHeader(‘Access-Control-Allow-Origin’, ‘*’);
 res.setHeader(‘Access-Control-Allow-Methods’, ‘POST, OPTIONS’);
 res.setHeader(‘Access-Control-Allow-Headers’, ‘Content-Type’);
+
 if (req.method === ‘OPTIONS’) return res.status(200).end();
 if (req.method !== ‘POST’) return res.status(405).json({ error: ‘Method not allowed’ });
 
@@ -16,11 +13,6 @@ if (!niche || !tone || !topic) {
 return res.status(400).json({ error: ‘niche, tone, topic مطلوبة’ });
 }
 
-if (topic.length < 10) {
-return res.status(400).json({ error: ‘الموضوع قصير جداً، أضف تفاصيل أكثر’ });
-}
-
-// ── 1. CHECK SESSION LIMIT (Supabase) ──
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
 const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY;
@@ -29,54 +21,41 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !DEEPSEEK_KEY) {
 return res.status(500).json({ error: ‘Environment variables missing’ });
 }
 
-const headers = {
+const sbHeaders = {
 ‘Content-Type’: ‘application/json’,
 ‘apikey’: SUPABASE_KEY,
-‘Authorization’: `Bearer ${SUPABASE_KEY}`,
+‘Authorization’: ’Bearer ’ + SUPABASE_KEY,
 };
 
-// Check how many posts this session already generated
+// فحص التجربة المجانية
 if (session_id) {
+try {
 const checkRes = await fetch(
-`${SUPABASE_URL}/rest/v1/posts?session_id=eq.${session_id}&select=id`,
-{ headers }
+SUPABASE_URL + ‘/rest/v1/posts?session_id=eq.’ + session_id + ‘&select=id’,
+{ headers: sbHeaders }
 );
 const existing = await checkRes.json();
 if (Array.isArray(existing) && existing.length >= 1) {
 return res.status(429).json({
 error: ‘trial_used’,
-message: ‘لقد استخدمت تجربتك المجانية. سجّل للحصول على المزيد.’
+message: ‘لقد استخدمت تجربتك المجانية.’
 });
 }
+} catch (e) {}
 }
 
-// ── 2. CALL DEEPSEEK API ──
-const prompt = `أنت خبير في إنشاء محتوى LinkedIn باللغة العربية متخصص في مجال ${niche}.
-
-اكتب منشور LinkedIn واحد باللغة العربية بأسلوب ${tone}.
-
-الموضوع: ${topic}
-
-المتطلبات:
-
-- ابدأ بـ hook قوي يوقف التمرير (السطر الأول حاسم)
-- 150-250 كلمة
-- فقرات قصيرة مع مسافات للقراءة السهلة
-- اختم بسؤال مثير للتفكير أو CTA واضح
-- 3-5 هاشتاقات عربية ذات صلة في النهاية
-- اكتب بالعربية فقط
-
-أخرج نص المنشور فقط بدون أي مقدمة أو شرح.`;
-
+// استدعاء DeepSeek
 let generatedText = ‘’;
 let tokensUsed = 0;
 
+const prompt = ’أنت خبير في إنشاء محتوى LinkedIn باللغة العربية متخصص في مجال ’ + niche + ’.\n\nاكتب منشور LinkedIn واحد باللغة العربية بأسلوب ’ + tone + ’.\n\nالموضوع: ’ + topic + ‘\n\nالمتطلبات:\n- ابدأ بـ hook قوي يوقف التمرير\n- 150-250 كلمة\n- فقرات قصيرة مع مسافات\n- اختم بسؤال أو CTA واضح\n- 3-5 هاشتاقات عربية في النهاية\n- اكتب بالعربية فقط\n\nأخرج نص المنشور فقط.’;
+
 try {
-const deepseekRes = await fetch(‘https://api.deepseek.com/chat/completions’, {
+const dsRes = await fetch(‘https://api.deepseek.com/chat/completions’, {
 method: ‘POST’,
 headers: {
 ‘Content-Type’: ‘application/json’,
-‘Authorization’: `Bearer ${DEEPSEEK_KEY}`,
+‘Authorization’: ’Bearer ’ + DEEPSEEK_KEY,
 },
 body: JSON.stringify({
 model: ‘deepseek-chat’,
@@ -86,20 +65,19 @@ messages: [
 ],
 max_tokens: 800,
 temperature: 0.85,
-stream: false,
 }),
 });
 
 ```
-if (!deepseekRes.ok) {
-  const errBody = await deepseekRes.text();
-  console.error('DeepSeek error:', errBody);
-  return res.status(502).json({ error: 'فشل الاتصال بـ DeepSeek API' });
+if (!dsRes.ok) {
+  const errText = await dsRes.text();
+  console.error('DeepSeek error:', errText);
+  return res.status(502).json({ error: 'فشل الاتصال بـ DeepSeek: ' + dsRes.status });
 }
 
-const deepseekData = await deepseekRes.json();
-generatedText = deepseekData.choices?.[0]?.message?.content?.trim() || '';
-tokensUsed = deepseekData.usage?.total_tokens || 0;
+const dsData = await dsRes.json();
+generatedText = (dsData.choices && dsData.choices[0] && dsData.choices[0].message && dsData.choices[0].message.content || '').trim();
+tokensUsed = (dsData.usage && dsData.usage.total_tokens) || 0;
 
 if (!generatedText) {
   return res.status(502).json({ error: 'لم يتم استلام محتوى من DeepSeek' });
@@ -107,20 +85,20 @@ if (!generatedText) {
 ```
 
 } catch (err) {
-console.error(‘DeepSeek fetch error:’, err);
+console.error(‘DeepSeek fetch error:’, err.message);
 return res.status(502).json({ error: ‘خطأ في الاتصال بـ DeepSeek’ });
 }
 
-// ── 3. SAVE TO SUPABASE ──
+// حفظ في Supabase
 try {
-const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/posts`, {
+await fetch(SUPABASE_URL + ‘/rest/v1/posts’, {
 method: ‘POST’,
-headers: { …headers, ‘Prefer’: ‘return=representation’ },
+headers: Object.assign({}, sbHeaders, { ‘Prefer’: ‘return=minimal’ }),
 body: JSON.stringify({
 session_id: session_id || null,
-niche,
-tone,
-topic,
+niche: niche,
+tone: tone,
+topic: topic,
 content: generatedText,
 model: ‘deepseek-chat’,
 tokens_used: tokensUsed,
@@ -128,31 +106,19 @@ tokens_used: tokensUsed,
 });
 
 ```
-if (!insertRes.ok) {
-  console.error('Supabase insert failed:', await insertRes.text());
-}
-
-// Update analytics
-await fetch(`${SUPABASE_URL}/rest/v1/rpc/increment_daily_posts`, {
+await fetch(SUPABASE_URL + '/rest/v1/usage_log', {
   method: 'POST',
-  headers,
-}).catch(() => {});
-
-// Log usage
-await fetch(`${SUPABASE_URL}/rest/v1/usage_log`, {
-  method: 'POST',
-  headers,
+  headers: Object.assign({}, sbHeaders, { 'Prefer': 'return=minimal' }),
   body: JSON.stringify({
     session_id: session_id || null,
     action: 'generate_post',
-    metadata: { niche, tone, tokens: tokensUsed },
+    metadata: { niche: niche, tone: tone, tokens: tokensUsed },
   }),
-}).catch(() => {});
+});
 ```
 
 } catch (err) {
-console.error(‘Supabase save error:’, err);
-// Don’t fail the request — still return the generated text
+console.error(‘Supabase save error:’, err.message);
 }
 
 return res.status(200).json({
@@ -161,4 +127,4 @@ content: generatedText,
 tokens_used: tokensUsed,
 model: ‘deepseek-chat’,
 });
-}
+};
